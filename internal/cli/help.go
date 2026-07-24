@@ -15,7 +15,6 @@ import (
 
 func init() {
 	rootCmd.AddCommand(helpCmd)
-	helpCmd.Flags().Bool("raw", false, "output raw markdown")
 }
 
 var helpCmd = &cobra.Command{
@@ -36,20 +35,13 @@ Use 'help topics' to list all topics or 'help examples' for quickstarts.`,
 			return listDocs(topic)
 		}
 
-		raw, _ := cmd.Flags().GetBool("raw")
-
 		path := fmt.Sprintf("docs/%s.md", topic)
 		content, err := tillandsia.DocsFS.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("no documentation found for %q", topic)
 		}
 
-		if raw || jsonOutput {
-			cmd.Print(string(content))
-			return nil
-		}
-
-		cmd.Print(renderMarkdown(string(content)))
+		cmd.Print(string(content))
 		return nil
 	},
 }
@@ -126,35 +118,4 @@ func formatJSONList(entries []string, prefix string) string {
 	}
 	b, _ := json.MarshalIndent(items, "", "  ")
 	return string(b)
-}
-
-func renderMarkdown(input string) string {
-	var out strings.Builder
-	lines := strings.Split(input, "\n")
-	inCodeBlock := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(trimmed, "```"):
-			inCodeBlock = !inCodeBlock
-			out.WriteString(line + "\n")
-		case inCodeBlock:
-			out.WriteString("  " + line + "\n")
-		case strings.HasPrefix(line, "# "):
-			out.WriteString("\n" + line + "\n" + strings.Repeat("=", len(line)-2) + "\n\n")
-		case strings.HasPrefix(line, "## "):
-			out.WriteString("\n" + line + "\n" + strings.Repeat("-", len(line)-3) + "\n")
-		case strings.HasPrefix(line, "### "):
-			out.WriteString("\n" + line + "\n")
-		case strings.HasPrefix(line, "- "):
-			out.WriteString("  " + line + "\n")
-		case strings.HasPrefix(line, "|"):
-			out.WriteString(line + "\n")
-		case line == "":
-			out.WriteString("\n")
-		default:
-			out.WriteString(line + "\n")
-		}
-	}
-	return out.String()
 }

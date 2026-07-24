@@ -14,11 +14,11 @@ import (
 type detectedLanguage string
 
 const (
-	langNode   detectedLanguage = "node"
-	langPython detectedLanguage = "python"
-	langGo     detectedLanguage = "go"
-	langRuby   detectedLanguage = "ruby"
-	langStatic detectedLanguage = "static"
+	langNode    detectedLanguage = "node"
+	langPython  detectedLanguage = "python"
+	langGo      detectedLanguage = "go"
+	langRuby    detectedLanguage = "ruby"
+	langStatic  detectedLanguage = "static"
 	langUnknown detectedLanguage = "unknown"
 )
 
