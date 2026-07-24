@@ -2,24 +2,23 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	caddyhttp "github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 const CaddyfilePath = "/etc/caddy/Caddyfile"
 
 type CaddyManager struct {
-	domain    string
-	port      int
+	domain      string
+	port        int
 	customCaddy string
-	cmd       *exec.Cmd
-	running   bool
-	logger    *log.Logger
+	running     bool
+	logger      *log.Logger
 }
 
 func NewCaddyManager(domain string, port int, customCaddy string, logger *log.Logger) *CaddyManager {
@@ -56,75 +55,94 @@ func (cm *CaddyManager) GenerateCaddyfile() string {
 
 func (cm *CaddyManager) WriteCaddyfile() error {
 	content := cm.GenerateCaddyfile()
-	dir := filepath.Dir(CaddyfilePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating caddy directory: %w", err)
-	}
 	return os.WriteFile(CaddyfilePath, []byte(content), 0644)
 }
 
-func (cm *CaddyManager) Start(ctx context.Context) error {
-	if err := cm.WriteCaddyfile(); err != nil {
-		return fmt.Errorf("writing caddyfile: %w", err)
+func (cm *CaddyManager) buildConfig() (*caddy.Config, error) {
+	route := caddyhttp.Route{
+		HandlersRaw: []json.RawMessage{
+			json.RawMessage(fmt.Sprintf(`{"handler": "subroute", "routes": [{"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "localhost:%d"}]}]}]}`, cm.port)),
+		},
 	}
 
-	cm.cmd = exec.CommandContext(ctx, "caddy", "run", "--config", CaddyfilePath)
-	cm.cmd.Stdout = os.Stdout
-	cm.cmd.Stderr = os.Stderr
-	cm.cmd.Env = os.Environ()
+	if cm.domain != "" {
+		route.MatcherSetsRaw = caddyhttp.RawMatcherSets{
+			caddy.ModuleMap{
+				"host": json.RawMessage(fmt.Sprintf(`["%s"]`, cm.domain)),
+			},
+		}
+	}
 
-	if err := cm.cmd.Start(); err != nil {
+	listenAddr := ":80"
+	if cm.domain != "" {
+		listenAddr = fmt.Sprintf(":%d", 443)
+	}
+
+	server := &caddyhttp.Server{
+		Listen: []string{listenAddr},
+		Routes: caddyhttp.RouteList{route},
+	}
+
+	httpApp := &caddyhttp.App{
+		Servers: map[string]*caddyhttp.Server{"tillandsia": server},
+	}
+
+	cfg := &caddy.Config{
+		AppsRaw: caddy.ModuleMap{
+			"http": json.RawMessage(`{}`),
+		},
+		Admin: &caddy.AdminConfig{
+			Disabled: true,
+		},
+	}
+
+	httpAppRaw, err := json.Marshal(httpApp)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling http app config: %w", err)
+	}
+	cfg.AppsRaw["http"] = httpAppRaw
+
+	return cfg, nil
+}
+
+func (cm *CaddyManager) Start(ctx context.Context) error {
+	cfg, err := cm.buildConfig()
+	if err != nil {
+		return fmt.Errorf("building caddy config: %w", err)
+	}
+
+	if err := caddy.Run(cfg); err != nil {
 		return fmt.Errorf("starting caddy: %w", err)
 	}
 
 	cm.running = true
+	cm.logger.Println("caddy started")
 
-	// Monitor in background
+	// Monitor for exit in background
 	go func() {
-		if err := cm.cmd.Wait(); err != nil {
-			cm.logger.Printf("caddy exited: %v", err)
-		}
-		cm.running = false
+		<-ctx.Done()
+		cm.Stop(context.Background())
 	}()
 
-	// Give Caddy a moment to start
-	time.Sleep(500 * time.Millisecond)
 	return nil
 }
 
-func (cm *CaddyManager) Stop(ctx context.Context) error {
-	if cm.cmd != nil && cm.cmd.Process != nil {
-		if err := cm.cmd.Process.Signal(os.Interrupt); err != nil {
-			cm.cmd.Process.Kill()
+func (cm *CaddyManager) Stop(ctx context.Context) {
+	if cm.running {
+		cm.logger.Println("stopping caddy...")
+		if err := caddy.Stop(); err != nil {
+			cm.logger.Printf("caddy stop error: %v", err)
 		}
-		done := make(chan struct{})
-		go func() {
-			cm.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-ctx.Done():
-			cm.cmd.Process.Kill()
-		}
+		cm.running = false
+		cm.logger.Println("caddy stopped")
 	}
-	cm.running = false
-	return nil
 }
 
 func (cm *CaddyManager) IsRunning() bool {
 	return cm.running
 }
 
-// ZeroDowntimeHandoff checks if an old container is running on the management
-// port and asks it to shut down gracefully.
 func ZeroDowntimeHandoff(ctx context.Context, mgmtPort int, appName string) error {
-	// Check for existing management server on the given port
-	// This is a simple TCP check + HTTP request
-	// In practice, the old container's management API would be at
-	// the old container's IP:8080/mgmt/shutdown
-
-	// For now, this is a stub that will be fleshed out in Phase 6
 	return nil
 }
 
@@ -165,12 +183,4 @@ func readCaddyfile() (string, error) {
 		return string(data), nil
 	}
 	return "", fmt.Errorf("caddyfile not found at %s", CaddyfilePath)
-}
-
-func cleanEnvName(s string) string {
-	return strings.NewReplacer(
-		"-", "_",
-		".", "_",
-		" ", "_",
-	).Replace(strings.ToUpper(s))
 }

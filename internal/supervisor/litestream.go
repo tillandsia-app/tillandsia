@@ -5,16 +5,18 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/benbjohnson/litestream"
 )
 
 const (
-	LitestreamConfigPath = "/etc/litestream.yml"
+	LitestreamConfigPath  = "/etc/litestream.yml"
 	LitestreamRestoreTimeout = 60 * time.Second
-	DataDir             = "/data"
-	DBPath              = "/data/db"
+	DataDir              = "/data"
+	DBPath               = "/data/db"
+	SyncInterval         = 1 * time.Second
 )
 
 type LitestreamEnv struct {
@@ -26,10 +28,10 @@ type LitestreamEnv struct {
 
 type LitestreamManager struct {
 	env     *LitestreamEnv
-	cmd     *exec.Cmd
+	db      *litestream.DB
+	replica *litestream.Replica
 	running bool
 	logger  *log.Logger
-	lag     int64
 }
 
 func NewLitestreamManager(env *LitestreamEnv, logger *log.Logger) *LitestreamManager {
@@ -39,24 +41,19 @@ func NewLitestreamManager(env *LitestreamEnv, logger *log.Logger) *LitestreamMan
 	}
 }
 
-func (lm *LitestreamManager) GenerateConfig() string {
-	path := filepath.Join(DataDir, "db")
-	config := fmt.Sprintf(`dbs:
-  - path: %s
-    replicas:
-      - url: %s
-`, path, lm.env.URL)
-
-	return config
-}
-
-func (lm *LitestreamManager) WriteConfig() error {
-	content := lm.GenerateConfig()
-	dir := filepath.Dir(LitestreamConfigPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating litestream config directory: %w", err)
+func (lm *LitestreamManager) setupReplica(db *litestream.DB) error {
+	client, err := litestream.NewReplicaClientFromURL(lm.env.URL)
+	if err != nil {
+		return fmt.Errorf("creating replica client: %w", err)
 	}
-	return os.WriteFile(LitestreamConfigPath, []byte(content), 0644)
+
+	lm.replica = litestream.NewReplicaWithClient(db, client)
+	lm.replica.SyncInterval = SyncInterval
+	lm.replica.MonitorEnabled = true
+
+	db.Replica = lm.replica
+
+	return nil
 }
 
 func (lm *LitestreamManager) Restore(ctx context.Context) error {
@@ -65,12 +62,10 @@ func (lm *LitestreamManager) Restore(ctx context.Context) error {
 		return nil
 	}
 
-	if err := lm.WriteConfig(); err != nil {
-		return fmt.Errorf("writing litestream config: %w", err)
-	}
+	dbPath := filepath.Join(DataDir, "db")
 
 	// Check if DB already exists
-	if _, err := os.Stat(DBPath); err == nil {
+	if _, err := os.Stat(dbPath); err == nil {
 		lm.logger.Println("litestream: database already exists, skipping restore")
 		return nil
 	}
@@ -79,19 +74,12 @@ func (lm *LitestreamManager) Restore(ctx context.Context) error {
 	defer cancel()
 
 	lm.logger.Println("litestream: restoring from latest snapshot...")
-	cmd := exec.CommandContext(restoreCtx, "litestream", "restore",
-		"-config", LitestreamConfigPath,
-		"-if-db-not-exists",
-		"-if-replica-exists",
-		"-o", DBPath,
-		lm.env.URL,
-	)
-	cmd.Env = lm.buildEnv()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
-	if err := cmd.Run(); err != nil {
-		// Not a hard failure - the app can still start without a DB restore
+	opts := litestream.NewRestoreOptions()
+	opts.OutputPath = dbPath
+
+	replica := &litestream.Replica{}
+	if err := replica.Restore(restoreCtx, opts); err != nil {
 		lm.logger.Printf("litestream: restore warning (starting fresh): %v", err)
 		return nil
 	}
@@ -105,61 +93,61 @@ func (lm *LitestreamManager) StartReplication(ctx context.Context) error {
 		return nil
 	}
 
-	cmd := exec.CommandContext(ctx, "litestream", "replicate",
-		"-config", LitestreamConfigPath,
-	)
-	cmd.Env = lm.buildEnv()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	dbPath := filepath.Join(DataDir, "db")
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting litestream replication: %w", err)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return fmt.Errorf("creating data directory: %w", err)
 	}
 
-	lm.cmd = cmd
-	lm.running = true
+	db := litestream.NewDB(dbPath)
+	db.MonitorInterval = 1 * time.Second
+	db.CheckpointInterval = 1 * time.Minute
+
+	if err := db.Open(); err != nil {
+		return fmt.Errorf("opening litestream db: %w", err)
+	}
+
+	if err := lm.setupReplica(db); err != nil {
+		db.Close(ctx)
+		return fmt.Errorf("setting up replica: %w", err)
+	}
+
+	lm.db = db
 
 	go func() {
-		if err := cmd.Wait(); err != nil {
+		if err := lm.replica.Start(ctx); err != nil {
 			lm.logger.Printf("litestream: replication exited: %v", err)
 		}
-		lm.running = false
 	}()
 
-	time.Sleep(500 * time.Millisecond)
+	lm.running = true
+	lm.logger.Println("litestream: replication started")
+
 	return nil
 }
 
-func (lm *LitestreamManager) Flush(ctx context.Context) error {
-	if lm.env.URL == "" {
-		return nil
+func (lm *LitestreamManager) Flush(ctx context.Context) {
+	if lm.db == nil {
+		return
 	}
 
 	lm.logger.Println("litestream: flushing WAL...")
-	cmd := exec.CommandContext(ctx, "litestream", "snapshot",
-		"-config", LitestreamConfigPath,
-		DBPath,
-	)
-	cmd.Env = lm.buildEnv()
-	if err := cmd.Run(); err != nil {
-		lm.logger.Printf("litestream: flush warning: %v", err)
+	if err := lm.db.SyncAndWait(ctx); err != nil {
+		lm.logger.Printf("litestream: sync warning: %v", err)
 	}
-	return nil
+	if _, err := lm.db.Snapshot(ctx); err != nil {
+		lm.logger.Printf("litestream: snapshot warning: %v", err)
+	}
 }
 
 func (lm *LitestreamManager) Stop() {
-	if lm.cmd != nil && lm.cmd.Process != nil {
-		lm.cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() {
-			lm.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			lm.cmd.Process.Kill()
-		}
+	if lm.replica != nil {
+		lm.replica.Stop(true)
+	}
+	if lm.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		lm.db.Close(ctx)
 	}
 	lm.running = false
 }
@@ -169,19 +157,12 @@ func (lm *LitestreamManager) IsRunning() bool {
 }
 
 func (lm *LitestreamManager) Lag() int64 {
-	return lm.lag
-}
-
-func (lm *LitestreamManager) buildEnv() []string {
-	env := os.Environ()
-	if lm.env.AccessKeyID != "" {
-		env = append(env, fmt.Sprintf("LITESTREAM_ACCESS_KEY_ID=%s", lm.env.AccessKeyID))
+	if lm.db == nil {
+		return 0
 	}
-	if lm.env.SecretAccessKey != "" {
-		env = append(env, fmt.Sprintf("LITESTREAM_SECRET_ACCESS_KEY=%s", lm.env.SecretAccessKey))
+	pos, err := lm.db.Pos()
+	if err != nil {
+		return 0
 	}
-	if lm.env.Region != "" {
-		env = append(env, fmt.Sprintf("LITESTREAM_REGION=%s", lm.env.Region))
-	}
-	return env
+	return int64(pos.TXID)
 }
