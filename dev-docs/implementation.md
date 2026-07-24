@@ -25,7 +25,8 @@ tillandsia/
 │   │   ├── mgmt.go           # Management HTTP API
 │   │   └── health.go         # Health check logic
 │   ├── build/
-│   │   └── docker.go         # Docker build + image wrapping
+│   │   ├── docker.go         # Docker build + image wrapping
+│   │   └── runtime.go        # Builder registry: runtime string → Dockerfile template
 │   ├── deploy/
 │   │   ├── pipeline.go       # Deploy orchestration
 │   │   └── transfer.go       # docker save/load via SSH pipe
@@ -108,7 +109,9 @@ tillandsia/
 | SSH library | `golang.org/x/crypto/ssh` | Standard library, well-maintained, supports key-based auth |
 | Container runtime | Docker | Universal, pre-installed on most VPS images, well-understood |
 | Image transfer | `docker save/load` via SSH pipe | Free tier, no registry needed. Registry = pro feature |
-| Config format | `tillandsia.yaml` + `Procfile` | Heroku-inspired, familiar pattern |
+| Config format | `tillandsia.yaml` (single source of truth) | Services, runtime, env all in one file. No separate Procfile. |
+| Dockerfile | Hidden by default | `tillandsia init` does not generate a Dockerfile. Build pipeline auto-generates it from `runtime` field. User creates a `Dockerfile` only for custom builds — its presence overrides the auto-generated one. |
+| Runtime versions | Builder registry in `internal/build/` | Maps `runtime: node:20` to a Dockerfile template. Defaults to latest LTS. Powered by known-good builder images. |
 | Reverse proxy | Caddy | Automatic TLS, simple config, Go binary |
 | Database backup | Litestream | Continuous SQLite replication to S3-compatible storage |
 | DNS | Caddy HTTP-01 (user creates A record) | Dead simple, no hosted infra needed. Hosted ACME zone = future |
@@ -132,13 +135,13 @@ tillandsia/
 - Define shared types: `App`, `Service`, `Config`, `Server`, `EnvEntry`, `LitestreamConfig`
 - Implement config parser:
   - Read `tillandsia.yaml` (with defaults for missing fields)
-  - Read `Procfile` (parse `type: command` format)
+  - Parse `services` map from config (e.g. `web: node server.js`)
   - Validate config (required fields, service types)
 - Implement `tillandsia init`:
   - Detect language from project files (package.json, requirements.txt, go.mod, Gemfile, index.html)
-  - Generate `Dockerfile` (language-specific multi-stage build)
-  - Generate `Procfile` (heuristic based on known frameworks)
-  - Generate `tillandsia.yaml` (with defaults)
+  - Write `runtime: node:20` (or detected) instead of a Dockerfile
+  - Write `services` in `tillandsia.yaml` instead of a separate Procfile
+  - Generate `tillandsia.yaml` (with defaults, no Dockerfile, no Procfile)
   - Generate sample app if directory is empty
   - `--language` flag to force a specific runtime
   - `--json` flag for agent output
@@ -173,6 +176,60 @@ tillandsia/
 - `tillandsia help` lists topics
 - `tillandsia help deploy` renders the deploy doc
 - `tillandsia help deploy --json` outputs JSON
+
+---
+
+### Phase 1a — Consolidate Config, Hidden Dockerfile, Runtime Registry
+
+**Goal:** Eliminate separate Procfile and Dockerfile. `tillandsia.yaml` becomes the single source of truth. The build pipeline auto-generates Dockerfiles from a `runtime` field.
+
+**Motivation:**
+- Most apps don't need a custom Dockerfile — hide it
+- Procfile configuration belongs in the config YAML
+- Runtime versions should be a simple key (e.g. `node:20`) mapped to known-good builders
+
+**Tasks:**
+
+- Update `Config` type:
+  - Add `Runtime string` field (e.g. `"node:20"`, `"python:3.12"`)
+  - Replace `Services []*Service` with `Services map[string]string` (e.g. `{"web": "node server.js"}`)
+  - Make `Build` optional (`*BuildConfig`) — nil means auto-generate
+- Update config parser:
+  - Remove `ReadProcfile` / `WriteProcfile` / `ParseProcfile` — services live in YAML now
+  - Read `services` map from `tillandsia.yaml`
+  - Validate service types
+- Implement builder registry (`internal/build/runtime.go`):
+  - Map runtime strings to Dockerfile templates
+  - `func GenerateDockerfile(runtime string) (string, error)` — returns a Dockerfile as string
+  - Supported runtimes: `node:20`, `node:22`, `python:3.12`, `python:3.13`, `go:1.22`, `go:1.23`, `ruby:3.3`, `ruby:3.4`, `static`
+  - Each template is a known-good multi-stage Dockerfile (same patterns as current `init.go` constants)
+  - Default to latest LTS version when minor is omitted (e.g. `node` → `node:20`)
+- Update `tillandsia init`:
+  - Write `runtime: node:20` (or detected) instead of generating a Dockerfile
+  - Write `services` in `tillandsia.yaml` instead of a separate Procfile
+  - Remove Dockerfile generation from `scaffoldDockerfile` (no longer needed)
+  - `--language` flag now maps to runtime strings (`node` → `node:20`, `python` → `python:3.12`)
+- Update deploy pipeline (Phase 5):
+  - If `runtime` is set and no custom `Dockerfile` exists: generate Dockerfile from builder registry
+  - If custom `Dockerfile` exists: use it as-is (overrides runtime)
+  - Tag image as `tillandsia/<app-name>:<timestamp>`
+- Update init system (Phase 4):
+  - Read services from config (passed via env or mounted config), not from Procfile
+- Remove `ReadProcfile` / `WriteProcfile` from `internal/config/`
+
+**Files changed:**
+- `internal/types/types.go` — updated `Config`, `Service`, `BuildConfig`
+- `internal/config/config.go` — remove Procfile functions, add services parsing
+- `internal/cli/init.go` — write `runtime` + `services` instead of Dockerfile + Procfile
+- `internal/build/runtime.go` — **new file**, builder registry
+
+**Verification:**
+- `tillandsia init` produces a `tillandsia.yaml` with `runtime` and `services`, no `Dockerfile`, no `Procfile`
+- `tillandsia init --language python` produces `runtime: python:3.12`
+- Config parser rejects invalid service types
+- `GenerateDockerfile("node:20")` returns a valid Dockerfile
+- `GenerateDockerfile("node")` returns the `node:20` template (latest LTS default)
+- `go build ./...` compiles
 
 ---
 
@@ -299,8 +356,8 @@ servers:
 
 **Tasks:**
 
-- Implement Procfile parser:
-  - Parse `type: command` format
+- Parse services from config:
+  - Read `services` map from `tillandsia.yaml` (e.g. `web: node server.js`)
   - Validate service types (web, worker, cron)
   - Extract command string for each service
 - Implement process supervisor:
@@ -346,7 +403,37 @@ servers:
   - Wait for old container to exit
   - Start normally
 
-**Key interfaces:**
+**Key types:**
+
+```go
+type ServiceType string
+const (
+    ServiceTypeWeb    ServiceType = "web"
+    ServiceTypeWorker ServiceType = "worker"
+    ServiceTypeCron   ServiceType = "cron"
+)
+
+type Service struct {
+    Type    ServiceType
+    Command string
+}
+
+type Config struct {
+    Name     string
+    Port     int
+    Runtime  string            // e.g. "node:20", "python:3.12", "go:1.22"
+    Services map[string]string // e.g. {"web": "node server.js"}
+    Env      map[string]string
+    Build    *BuildConfig      // optional, set only if user provides custom Dockerfile
+}
+
+type BuildConfig struct {
+    Dockerfile string // only used when user has a custom Dockerfile
+    Context    string
+}
+```
+
+**Supervisor interface (init system):**
 
 ```go
 type Supervisor struct { /* ... */ }
@@ -375,10 +462,10 @@ func (s *Supervisor) Health() HealthStatus
 **Tasks:**
 
 - Implement Docker build:
-  - Run `docker build` with user's Dockerfile and context
+  - If `runtime` is set in config and no custom `Dockerfile` exists: generate a Dockerfile from the builder registry (`internal/build/runtime.go`)
+  - If a custom `Dockerfile` exists: use it as-is (overrides runtime)
+  - Run `docker build` with the (generated or user-provided) Dockerfile and context
   - Tag image as `tillandsia/<app-name>:<timestamp>`
-  - Handle build failures with clear error messages
-  - Support build args from config
 - Implement image wrapping:
   - Create a wrapper Dockerfile:
     ```dockerfile
