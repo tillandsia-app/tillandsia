@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -40,10 +41,7 @@ func ReadConfig(dir string) (*types.Config, error) {
 	}
 	cfg := &types.Config{
 		Port: 8080,
-		Build: types.BuildConfig{
-			Dockerfile: "Dockerfile",
-			Context:    ".",
-		},
+		Env:  make(map[string]string),
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", ConfigFileName, err)
@@ -51,8 +49,19 @@ func ReadConfig(dir string) (*types.Config, error) {
 	if cfg.Name == "" {
 		cfg.Name = filepath.Base(dir)
 	}
-	if cfg.Env == nil {
-		cfg.Env = make(map[string]string)
+	if cfg.Services == nil {
+		return nil, fmt.Errorf("%s: at least one service is required (e.g. 'web: node server.js')", ConfigFileName)
+	}
+	for st := range cfg.Services {
+		if !types.ValidServiceType(st) {
+			return nil, fmt.Errorf("%s: invalid service type %q (must be web, worker, or cron)", ConfigFileName, st)
+		}
+	}
+	if cfg.Build != nil && cfg.Build.Context == "" {
+		cfg.Build.Context = "."
+	}
+	if cfg.Build != nil && cfg.Build.Dockerfile == "" {
+		cfg.Build.Dockerfile = "Dockerfile"
 	}
 	return cfg, nil
 }
@@ -64,56 +73,6 @@ func WriteConfig(dir string, cfg *types.Config) error {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
 	return os.WriteFile(path, data, 0644)
-}
-
-const ProcfileName = "Procfile"
-
-func ReadProcfile(dir string) ([]*types.Service, error) {
-	path := filepath.Join(dir, ProcfileName)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading %s: %w", ProcfileName, err)
-	}
-	return ParseProcfile(string(data))
-}
-
-func ParseProcfile(content string) ([]*types.Service, error) {
-	var services []*types.Service
-	for _, line := range strings.Split(strings.TrimSpace(content), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid Procfile line: %q", line)
-		}
-		st := strings.TrimSpace(parts[0])
-		cmd := strings.TrimSpace(parts[1])
-		svc := &types.Service{
-			Type:    types.ServiceType(st),
-			Command: cmd,
-		}
-		switch svc.Type {
-		case types.ServiceTypeWeb, types.ServiceTypeWorker, types.ServiceTypeCron:
-		default:
-			return nil, fmt.Errorf("unknown service type %q in Procfile line %q", svc.Type, line)
-		}
-		services = append(services, svc)
-	}
-	return services, nil
-}
-
-func WriteProcfile(dir string, services []*types.Service) error {
-	var lines []string
-	for _, svc := range services {
-		lines = append(lines, fmt.Sprintf("%s: %s", svc.Type, svc.Command))
-	}
-	path := filepath.Join(dir, ProcfileName)
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644)
 }
 
 func ReadServersConfig() (*types.ServersConfig, error) {
@@ -159,4 +118,21 @@ func serversConfigPath() (string, error) {
 		return "", fmt.Errorf("getting home directory: %w", err)
 	}
 	return filepath.Join(home, ".config", "tillandsia", "servers.yaml"), nil
+}
+
+func ServicesFromConfig(cfg *types.Config) string {
+	var lines []string
+	for _, k := range sortedKeys(cfg.Services) {
+		lines = append(lines, fmt.Sprintf("%s: %s", k, cfg.Services[k]))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
