@@ -1,4 +1,4 @@
-module github.com/tillandsia/tillandsia
+module github.com/tillandsia-app/tillandsia
 
 go 1.26.5
 
