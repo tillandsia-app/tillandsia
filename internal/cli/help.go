@@ -81,7 +81,7 @@ func listDocs(kind string) error {
 		}
 	} else {
 		entries = filter(entries, func(s string) bool {
-			return !strings.HasPrefix(s, "examples") && s != "implementation.md"
+			return !strings.HasPrefix(s, "examples")
 		})
 		if jsonOutput {
 			fmt.Println(formatJSONList(entries, "tillandsia help "))
