@@ -22,6 +22,14 @@ const (
 	langUnknown detectedLanguage = "unknown"
 )
 
+var defaultRuntime = map[detectedLanguage]string{
+	langNode:   "node:20",
+	langPython: "python:3.12",
+	langGo:     "go:1.22",
+	langRuby:   "ruby:3.3",
+	langStatic: "static",
+}
+
 func init() {
 	rootCmd.AddCommand(initCmd)
 }
@@ -29,8 +37,8 @@ func init() {
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Scaffold a new Tillandsia project",
-	Long: `Detect your project's language and generate Dockerfile, Procfile,
-and tillandsia.yaml. If the directory is empty, a sample app is created.
+	Long: `Detect your project's language and generate tillandsia.yaml.
+If the directory is empty, a sample app is created.
 
 Supported languages: node, python, go, ruby, static`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,27 +75,21 @@ Supported languages: node, python, go, ruby, static`,
 
 		appName := filepath.Base(dir)
 
+		rt, ok := defaultRuntime[lang]
+		if !ok {
+			rt = "node:20"
+		}
+
+		startCmd := detectStartCommand(lang, appName)
+
 		cfg := &types.Config{
-			Name: appName,
-			Port: 8080,
-			Env:  map[string]string{},
-			Build: types.BuildConfig{
-				Dockerfile: "Dockerfile",
-				Context:    ".",
-			},
+			Name:     appName,
+			Port:     8080,
+			Runtime:  rt,
+			Services: map[string]string{"web": startCmd},
+			Env:      map[string]string{},
 		}
 		if err := config.WriteConfig(dir, cfg); err != nil {
-			return err
-		}
-
-		services := []*types.Service{
-			{Type: types.ServiceTypeWeb, Command: detectStartCommand(lang, appName)},
-		}
-		if err := config.WriteProcfile(dir, services); err != nil {
-			return err
-		}
-
-		if err := scaffoldDockerfile(dir, lang); err != nil {
 			return err
 		}
 
@@ -214,25 +216,6 @@ func scaffoldSampleApp(dir string, lang detectedLanguage) error {
 	}
 }
 
-func scaffoldDockerfile(dir string, lang detectedLanguage) error {
-	var dockerfile string
-	switch lang {
-	case langNode:
-		dockerfile = dockerfileNode
-	case langPython:
-		dockerfile = dockerfilePython
-	case langGo:
-		dockerfile = dockerfileGo
-	case langRuby:
-		dockerfile = dockerfileRuby
-	case langStatic:
-		dockerfile = dockerfileStatic
-	default:
-		dockerfile = dockerfileNode
-	}
-	return os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0644)
-}
-
 func writeFiles(dir string, files map[string]string) error {
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
@@ -306,51 +289,4 @@ const sampleHTML = `<!DOCTYPE html>
   <p>Deployed with Tillandsia.</p>
 </body>
 </html>
-`
-
-const dockerfileNode = `FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production 2>/dev/null || true
-COPY . .
-EXPOSE 8080
-CMD ["node", "server.js"]
-`
-
-const dockerfilePython = `FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
-COPY . .
-EXPOSE 8080
-CMD ["python", "app.py"]
-`
-
-const dockerfileGo = `FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -o app .
-
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /app
-COPY --from=builder /app/app .
-EXPOSE 8080
-CMD ["./app"]
-`
-
-const dockerfileRuby = `FROM ruby:3.3-alpine
-WORKDIR /app
-COPY Gemfile Gemfile.lock ./
-RUN bundle install 2>/dev/null || true
-COPY . .
-EXPOSE 8080
-CMD ["ruby", "app.rb"]
-`
-
-const dockerfileStatic = `FROM nginx:alpine
-COPY . /usr/share/nginx/html
-EXPOSE 80
 `

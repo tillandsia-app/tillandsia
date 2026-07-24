@@ -8,21 +8,18 @@ const (
 	ServiceTypeCron   ServiceType = "cron"
 )
 
-type Service struct {
-	Type    ServiceType `yaml:"-" json:"type"`
-	Command string      `yaml:"-" json:"command"`
-}
-
 type BuildConfig struct {
 	Dockerfile string `yaml:"dockerfile" json:"dockerfile"`
 	Context    string `yaml:"context" json:"context"`
 }
 
 type Config struct {
-	Name  string            `yaml:"name" json:"name"`
-	Port  int               `yaml:"port" json:"port"`
-	Env   map[string]string `yaml:"env" json:"env"`
-	Build BuildConfig       `yaml:"build" json:"build"`
+	Name     string            `yaml:"name" json:"name"`
+	Port     int               `yaml:"port" json:"port"`
+	Runtime  string            `yaml:"runtime" json:"runtime"`
+	Services map[string]string `yaml:"services" json:"services"`
+	Env      map[string]string `yaml:"env" json:"env"`
+	Build    *BuildConfig      `yaml:"build,omitempty" json:"build,omitempty"`
 }
 
 type LitestreamConfig struct {
@@ -54,8 +51,16 @@ type EnvEntry struct {
 }
 
 type App struct {
-	Name     string
-	Dir      string
-	Config   *Config
-	Services []*Service
+	Name   string
+	Dir    string
+	Config *Config
+}
+
+func ValidServiceType(s string) bool {
+	switch ServiceType(s) {
+	case ServiceTypeWeb, ServiceTypeWorker, ServiceTypeCron:
+		return true
+	default:
+		return false
+	}
 }
