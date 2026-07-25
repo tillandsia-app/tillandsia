@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tillandsia/tillandsia/internal/ssh"
+	"github.com/tillandsia-app/tillandsia/internal/ssh"
 )
 
 func Setup(ctx context.Context, host, user, keyPath string, port int) error {

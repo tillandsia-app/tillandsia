@@ -9,7 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/tillandsia/tillandsia/internal/types"
+	"github.com/tillandsia-app/tillandsia/internal/types"
 )
 
 const ConfigFileName = "tillandsia.yaml"

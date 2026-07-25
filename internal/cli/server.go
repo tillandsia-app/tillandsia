@@ -9,9 +9,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/tillandsia/tillandsia/internal/config"
-	"github.com/tillandsia/tillandsia/internal/server"
-	"github.com/tillandsia/tillandsia/internal/types"
+	"github.com/tillandsia-app/tillandsia/internal/config"
+	"github.com/tillandsia-app/tillandsia/internal/server"
+	"github.com/tillandsia-app/tillandsia/internal/types"
 )
 
 var serverCmd = &cobra.Command{

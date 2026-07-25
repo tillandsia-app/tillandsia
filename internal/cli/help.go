@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/tillandsia/tillandsia"
+	"github.com/tillandsia-app/tillandsia"
 )
 
 func init() {
