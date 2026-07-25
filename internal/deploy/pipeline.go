@@ -126,28 +126,24 @@ func RunWithSteps(ctx context.Context, opts *Options, stepFn StepFunc) (*Result,
 	}
 	defer client.Close()
 
+	if opts.Rollback {
+		return runRollback(ctx, client, opts, stepFn)
+	}
+	return runDeploy(ctx, client, opts, stepFn)
+}
+
+func runDeploy(ctx context.Context, client *ssh.Client, opts *Options, stepFn StepFunc) (*Result, error) {
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	userTag := fmt.Sprintf("tillandsia/%s:%s", opts.AppName, timestamp)
 	wrappedTag := userTag + "-wrapped"
 
-	var steps []Step
-
-	if opts.Rollback {
-		prevTag, err := findPreviousImage(ctx, client, opts.AppName)
-		if err != nil {
-			return nil, err
-		}
-		wrappedTag = fmt.Sprintf("tillandsia/%s:%s-wrapped", opts.AppName, prevTag)
-		steps = rollbackSteps(client, opts, wrappedTag)
-	} else {
-		steps = []Step{
-			&buildUserImageStep{opts: opts, tag: userTag},
-			&buildWrapperImageStep{opts: opts, baseTag: userTag, wrappedTag: wrappedTag},
-			&transferImageStep{client: client, tag: wrappedTag},
-			&stopContainerStep{client: client, appName: opts.AppName},
-			&startContainerStep{client: client, opts: opts, tag: wrappedTag},
-			&waitForHealthyStep{client: client, appName: opts.AppName, interval: opts.HealthCheckInterval},
-		}
+	steps := []Step{
+		&buildUserImageStep{opts: opts, tag: userTag},
+		&buildWrapperImageStep{opts: opts, baseTag: userTag, wrappedTag: wrappedTag},
+		&transferImageStep{client: client, tag: wrappedTag},
+		&stopContainerStep{client: client, appName: opts.AppName},
+		&startContainerStep{client: client, opts: opts, tag: wrappedTag},
+		&waitForHealthyStep{client: client, appName: opts.AppName, interval: opts.HealthCheckInterval},
 	}
 
 	for _, s := range steps {
@@ -160,12 +156,27 @@ func RunWithSteps(ctx context.Context, opts *Options, stepFn StepFunc) (*Result,
 	return &Result{ImageTag: wrappedTag, ServerHost: opts.Server.Host}, nil
 }
 
-func rollbackSteps(client *ssh.Client, opts *Options, wrappedTag string) []Step {
-	return []Step{
+func runRollback(ctx context.Context, client *ssh.Client, opts *Options, stepFn StepFunc) (*Result, error) {
+	prevTag, err := findPreviousImage(ctx, client, opts.AppName)
+	if err != nil {
+		return nil, err
+	}
+	wrappedTag := fmt.Sprintf("tillandsia/%s:%s-wrapped", opts.AppName, prevTag)
+
+	steps := []Step{
 		&stopContainerStep{client: client, appName: opts.AppName},
 		&startContainerStep{client: client, opts: opts, tag: wrappedTag},
 		&waitForHealthyStep{client: client, appName: opts.AppName, interval: opts.HealthCheckInterval},
 	}
+
+	for _, s := range steps {
+		s := s
+		if err := stepFn(ctx, s.Name(), func() error { return s.Run(ctx) }); err != nil {
+			return nil, err
+		}
+	}
+
+	return &Result{ImageTag: wrappedTag, ServerHost: opts.Server.Host}, nil
 }
 
 func buildUserImage(ctx context.Context, opts *Options, tag string) error {
