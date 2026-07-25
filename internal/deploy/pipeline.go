@@ -94,14 +94,25 @@ func (s *stopContainerStep) Run(ctx context.Context) error {
 }
 
 type startContainerStep struct {
-	client *ssh.Client
-	opts   *Options
-	tag    string
+	client  *ssh.Client
+	opts    *Options
+	tag     string
+	dataDir string
 }
 
 func (s *startContainerStep) Name() string { return "Starting container" }
 func (s *startContainerStep) Run(ctx context.Context) error {
-	return startContainer(ctx, s.client, s.opts, s.tag)
+	return startContainer(ctx, s.client, s.opts, s.tag, s.dataDir)
+}
+
+type cleanupDataDirsStep struct {
+	client  *ssh.Client
+	appName string
+}
+
+func (s *cleanupDataDirsStep) Name() string { return "Cleaning up old data directories" }
+func (s *cleanupDataDirsStep) Run(ctx context.Context) error {
+	return cleanupDataDirs(ctx, s.client, s.appName)
 }
 
 type waitForHealthyStep struct {
@@ -136,14 +147,16 @@ func runDeploy(ctx context.Context, client *ssh.Client, opts *Options, stepFn St
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	userTag := fmt.Sprintf("tillandsia/%s:%s", opts.AppName, timestamp)
 	wrappedTag := userTag + "-wrapped"
+	dataDir := fmt.Sprintf("/var/lib/tillandsia/%s/data-%s", opts.AppName, timestamp)
 
 	steps := []Step{
 		&buildUserImageStep{opts: opts, tag: userTag},
 		&buildWrapperImageStep{opts: opts, baseTag: userTag, wrappedTag: wrappedTag},
 		&transferImageStep{client: client, tag: wrappedTag},
 		&stopContainerStep{client: client, appName: opts.AppName},
-		&startContainerStep{client: client, opts: opts, tag: wrappedTag},
+		&startContainerStep{client: client, opts: opts, tag: wrappedTag, dataDir: dataDir},
 		&waitForHealthyStep{client: client, appName: opts.AppName, interval: opts.HealthCheckInterval},
+		&cleanupDataDirsStep{client: client, appName: opts.AppName},
 	}
 
 	for _, s := range steps {
@@ -162,10 +175,11 @@ func runRollback(ctx context.Context, client *ssh.Client, opts *Options, stepFn 
 		return nil, err
 	}
 	wrappedTag := fmt.Sprintf("tillandsia/%s:%s-wrapped", opts.AppName, prevTag)
+	dataDir := fmt.Sprintf("/var/lib/tillandsia/%s/data-%s", opts.AppName, prevTag)
 
 	steps := []Step{
 		&stopContainerStep{client: client, appName: opts.AppName},
-		&startContainerStep{client: client, opts: opts, tag: wrappedTag},
+		&startContainerStep{client: client, opts: opts, tag: wrappedTag, dataDir: dataDir},
 		&waitForHealthyStep{client: client, appName: opts.AppName, interval: opts.HealthCheckInterval},
 	}
 
@@ -308,9 +322,8 @@ func stopContainer(ctx context.Context, client *ssh.Client, appName string) erro
 	return nil
 }
 
-func startContainer(ctx context.Context, client *ssh.Client, opts *Options, tag string) error {
+func startContainer(ctx context.Context, client *ssh.Client, opts *Options, tag string, dataDir string) error {
 	envFile := fmt.Sprintf("/var/lib/tillandsia/%s/env", opts.AppName)
-	dataDir := fmt.Sprintf("/var/lib/tillandsia/%s/data", opts.AppName)
 
 	port := opts.Config.Port
 	if port == 0 {
@@ -342,7 +355,7 @@ func startContainer(ctx context.Context, client *ssh.Client, opts *Options, tag 
 
 	if err := client.PipeToCommand(ctx,
 		strings.NewReader(envContent),
-		fmt.Sprintf("mkdir -p /var/lib/tillandsia/%s && cat > %s", opts.AppName, envFile)); err != nil {
+		fmt.Sprintf("mkdir -p /var/lib/tillandsia/%s %s && cat > %s", opts.AppName, dataDir, envFile)); err != nil {
 		return fmt.Errorf("writing env file: %w", err)
 	}
 
@@ -410,6 +423,15 @@ func findPreviousImage(ctx context.Context, client *ssh.Client, appName string) 
 		return "", fmt.Errorf("no previous image found for rollback")
 	}
 	return prevTag, nil
+}
+
+func cleanupDataDirs(ctx context.Context, client *ssh.Client, appName string) error {
+	basePath := fmt.Sprintf("/var/lib/tillandsia/%s", appName)
+	// List data-* dirs, keep last 3, remove older ones
+	cmd := fmt.Sprintf(
+		"ls -1d %s/data-* 2>/dev/null | sort | head -n -3 | xargs -r rm -rf", basePath)
+	_, err := client.Run(ctx, cmd)
+	return err
 }
 
 func servicesEnvStr(services map[string]string) string {
