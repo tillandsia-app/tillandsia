@@ -126,4 +126,68 @@ tillandsia/
 ├── Makefile
 ├── .goreleaser.yaml
 └── DEVLOG.md
+
+## 2026-07-25 — Phase 5: Deploy Pipeline
+
+### New `internal/deploy/pipeline.go`
+
+Deploy orchestration with a `Step` interface pattern:
+
+- **`buildUserImage`** — generates Dockerfile from runtime registry or uses custom Dockerfile,
+  then runs `docker build`
+- **`buildWrapperImage`** — builds `tillandsia-init` binary, creates a wrapper Dockerfile that
+  copies it into the user image, sets `ENTRYPOINT ["tillandsia-init"]`
+- **`transferImage`** — pipes `docker save` stdout through SSH into `docker load` on the remote
+  server via the new `PipeToCommand` SSH method
+- **`stopContainer` / `startContainer`** — Docker lifecycle on the remote server via SSH commands
+- **`waitForHealthy`** — polls `docker inspect` at 5s intervals (configurable) for up to 60s
+- **`findPreviousImage` / `runRollback`** — rollback to the previous image version
+- **Version-isolated data dirs** — each deploy gets `/var/lib/tillandsia/<app>/data-<timestamp>`
+  instead of a shared `data/`, preventing SQLite lock conflicts. Old dirs cleaned up after deploy
+  (keep last 3). Dev note suggests moving cleanup to a server cron job eventually.
+
+### New CLI commands
+
+- **`tillandsia deploy`** — `--server`, `--dry-run`, `--rollback` flags
+- **`tillandsia status`** — queries `docker inspect` on the server, shows container state/health
+- **`tillandsia logs`** — `--tail`, `--follow`, `--server` flags; streams via SSH
+- **`tillandsia env set/get/rm/list/export`** — each with `--server`; reads/writes env file on
+  server and restarts container
+
+### SSH module refactor
+
+`internal/ssh/ssh.go` — `Transfer()` refactored to delegate to new `PipeToCommand()`, which
+pipes stdin to any remote command (used for `docker load` in image transfer).
+
+### Security fixes (from review)
+
+- `types.ValidateAppName()` — regex-based validation (alphanumeric, hyphens, underscores, max 64 chars)
+  enforced at config load time in `config.ReadConfig()` and as defense-in-depth in pipeline
+- All shell interpolations of app name are now behind validated inputs
+
+### Dev notes added
+
+- `dev-docs/notes/multi-backend-apps.md` — YAML-based backend port mapping with Caddy proxying
+- `dev-docs/notes/encrypted-env-vars.md` — concept for on-disk env encryption with one-time
+  unlock
+- `dev-docs/notes/data-dir-cleanup.md` — cron job alternative for data dir cleanup
+- `dev-docs/notes/docker-api.md` — SWAG for switching from CLI to Go SDK
+
+### Project structure update
+
+```
+internal/
+├── cli/
+│   ├── root.go
+│   ├── init.go
+│   ├── help.go
+│   ├── server.go
+│   ├── deploy.go      # NEW: deploy + status commands
+│   ├── logs.go         # NEW: log streaming
+│   └── env.go          # NEW: env var management
+├── deploy/              # NEW: deploy pipeline package
+│   └── pipeline.go
+└── ssh/
+    └── ssh.go          # MODIFIED: added PipeToCommand
+```
 ```
