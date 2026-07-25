@@ -1,5 +1,10 @@
 package types
 
+import (
+	"fmt"
+	"regexp"
+)
+
 type ServiceType string
 
 const (
@@ -7,6 +12,21 @@ const (
 	ServiceTypeWorker ServiceType = "worker"
 	ServiceTypeCron   ServiceType = "cron"
 )
+
+var validNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+func ValidateAppName(name string) error {
+	if name == "" {
+		return fmt.Errorf("app name must not be empty")
+	}
+	if !validNameRe.MatchString(name) {
+		return fmt.Errorf("invalid app name %q: only letters, digits, hyphens, and underscores allowed", name)
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("app name too long (max 64 characters)")
+	}
+	return nil
+}
 
 type BuildConfig struct {
 	Dockerfile string `yaml:"dockerfile" json:"dockerfile"`
