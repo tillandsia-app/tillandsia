@@ -49,6 +49,9 @@ func ReadConfig(dir string) (*types.Config, error) {
 	if cfg.Name == "" {
 		cfg.Name = filepath.Base(dir)
 	}
+	if err := types.ValidateAppName(cfg.Name); err != nil {
+		return nil, fmt.Errorf("%s: %w", ConfigFileName, err)
+	}
 	if cfg.Services == nil {
 		return nil, fmt.Errorf("%s: at least one service is required (e.g. 'web: node server.js')", ConfigFileName)
 	}

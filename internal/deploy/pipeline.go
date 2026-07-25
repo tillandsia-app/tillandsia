@@ -17,17 +17,23 @@ import (
 )
 
 type Options struct {
-	AppDir   string
-	AppName  string
-	Server   *types.Server
-	Config   *types.Config
-	Rollback bool
-	DryRun   bool
+	AppDir              string
+	AppName             string
+	Server              *types.Server
+	Config              *types.Config
+	Rollback            bool
+	DryRun              bool
+	HealthCheckInterval time.Duration // poll interval, default 5s
 }
 
 type Result struct {
 	ImageTag   string
 	ServerHost string
+}
+
+type Step interface {
+	Name() string
+	Run(ctx context.Context) error
 }
 
 type StepFunc func(ctx context.Context, name string, fn func() error) error
@@ -46,7 +52,74 @@ func Run(ctx context.Context, opts *Options) (*Result, error) {
 	return RunWithSteps(ctx, opts, DefaultStepFunc)
 }
 
-func RunWithSteps(ctx context.Context, opts *Options, step StepFunc) (*Result, error) {
+type buildUserImageStep struct {
+	opts *Options
+	tag  string
+}
+
+func (s *buildUserImageStep) Name() string { return "Building user image" }
+func (s *buildUserImageStep) Run(ctx context.Context) error {
+	return buildUserImage(ctx, s.opts, s.tag)
+}
+
+type buildWrapperImageStep struct {
+	opts       *Options
+	baseTag    string
+	wrappedTag string
+}
+
+func (s *buildWrapperImageStep) Name() string { return "Wrapping with init system" }
+func (s *buildWrapperImageStep) Run(ctx context.Context) error {
+	return buildWrapperImage(ctx, s.opts, s.baseTag, s.wrappedTag)
+}
+
+type transferImageStep struct {
+	client *ssh.Client
+	tag    string
+}
+
+func (s *transferImageStep) Name() string { return "Transferring image" }
+func (s *transferImageStep) Run(ctx context.Context) error {
+	return transferImage(ctx, s.client, s.tag)
+}
+
+type stopContainerStep struct {
+	client  *ssh.Client
+	appName string
+}
+
+func (s *stopContainerStep) Name() string { return "Stopping old container" }
+func (s *stopContainerStep) Run(ctx context.Context) error {
+	return stopContainer(ctx, s.client, s.appName)
+}
+
+type startContainerStep struct {
+	client *ssh.Client
+	opts   *Options
+	tag    string
+}
+
+func (s *startContainerStep) Name() string { return "Starting container" }
+func (s *startContainerStep) Run(ctx context.Context) error {
+	return startContainer(ctx, s.client, s.opts, s.tag)
+}
+
+type waitForHealthyStep struct {
+	client   *ssh.Client
+	appName  string
+	interval time.Duration
+}
+
+func (s *waitForHealthyStep) Name() string { return "Waiting for health" }
+func (s *waitForHealthyStep) Run(ctx context.Context) error {
+	return waitForHealthy(ctx, s.client, s.appName, s.interval)
+}
+
+func RunWithSteps(ctx context.Context, opts *Options, stepFn StepFunc) (*Result, error) {
+	if err := types.ValidateAppName(opts.AppName); err != nil {
+		return nil, fmt.Errorf("invalid app name: %w", err)
+	}
+
 	client, err := ssh.Connect(opts.Server.Host, opts.Server.User, opts.Server.Key, opts.Server.Port)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to server: %w", err)
@@ -57,52 +130,42 @@ func RunWithSteps(ctx context.Context, opts *Options, step StepFunc) (*Result, e
 	userTag := fmt.Sprintf("tillandsia/%s:%s", opts.AppName, timestamp)
 	wrappedTag := userTag + "-wrapped"
 
+	var steps []Step
+
 	if opts.Rollback {
-		if err := step(ctx, "Rolling back", func() error {
-			return rollbackDeploy(ctx, client, opts, step)
-		}); err != nil {
+		prevTag, err := findPreviousImage(ctx, client, opts.AppName)
+		if err != nil {
 			return nil, err
 		}
-		return &Result{ImageTag: wrappedTag, ServerHost: opts.Server.Host}, nil
+		wrappedTag = fmt.Sprintf("tillandsia/%s:%s-wrapped", opts.AppName, prevTag)
+		steps = rollbackSteps(client, opts, wrappedTag)
+	} else {
+		steps = []Step{
+			&buildUserImageStep{opts: opts, tag: userTag},
+			&buildWrapperImageStep{opts: opts, baseTag: userTag, wrappedTag: wrappedTag},
+			&transferImageStep{client: client, tag: wrappedTag},
+			&stopContainerStep{client: client, appName: opts.AppName},
+			&startContainerStep{client: client, opts: opts, tag: wrappedTag},
+			&waitForHealthyStep{client: client, appName: opts.AppName, interval: opts.HealthCheckInterval},
+		}
 	}
 
-	if err := step(ctx, "Building user image", func() error {
-		return buildUserImage(ctx, opts, userTag)
-	}); err != nil {
-		return nil, err
-	}
-
-	if err := step(ctx, "Wrapping with init system", func() error {
-		return buildWrapperImage(ctx, opts, userTag, wrappedTag)
-	}); err != nil {
-		return nil, err
-	}
-
-	if err := step(ctx, "Transferring image", func() error {
-		return transferImage(ctx, client, wrappedTag)
-	}); err != nil {
-		return nil, err
-	}
-
-	if err := step(ctx, "Stopping old container", func() error {
-		return stopContainer(ctx, client, opts.AppName)
-	}); err != nil {
-		return nil, err
-	}
-
-	if err := step(ctx, "Starting container", func() error {
-		return startContainer(ctx, client, opts, wrappedTag)
-	}); err != nil {
-		return nil, err
-	}
-
-	if err := step(ctx, "Waiting for health", func() error {
-		return waitForHealthy(ctx, client, opts.AppName)
-	}); err != nil {
-		return nil, err
+	for _, s := range steps {
+		s := s
+		if err := stepFn(ctx, s.Name(), func() error { return s.Run(ctx) }); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Result{ImageTag: wrappedTag, ServerHost: opts.Server.Host}, nil
+}
+
+func rollbackSteps(client *ssh.Client, opts *Options, wrappedTag string) []Step {
+	return []Step{
+		&stopContainerStep{client: client, appName: opts.AppName},
+		&startContainerStep{client: client, opts: opts, tag: wrappedTag},
+		&waitForHealthyStep{client: client, appName: opts.AppName, interval: opts.HealthCheckInterval},
+	}
 }
 
 func buildUserImage(ctx context.Context, opts *Options, tag string) error {
@@ -294,11 +357,14 @@ func startContainer(ctx context.Context, client *ssh.Client, opts *Options, tag 
 	return nil
 }
 
-func waitForHealthy(ctx context.Context, client *ssh.Client, appName string) error {
+func waitForHealthy(ctx context.Context, client *ssh.Client, appName string, interval time.Duration) error {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -321,39 +387,18 @@ func waitForHealthy(ctx context.Context, client *ssh.Client, appName string) err
 	}
 }
 
-func rollbackDeploy(ctx context.Context, client *ssh.Client, opts *Options, step StepFunc) error {
+func findPreviousImage(ctx context.Context, client *ssh.Client, appName string) (string, error) {
 	result, err := client.Run(ctx, fmt.Sprintf(
 		"docker images tillandsia/%s --format '{{.Tag}}' | grep -v wrapped | sort -n | tail -2 | head -1",
-		opts.AppName))
+		appName))
 	if err != nil {
-		return err
+		return "", err
 	}
 	prevTag := strings.TrimSpace(result.Stdout)
 	if prevTag == "" {
-		return fmt.Errorf("no previous image found for rollback")
+		return "", fmt.Errorf("no previous image found for rollback")
 	}
-
-	wrappedPrev := fmt.Sprintf("tillandsia/%s:%s-wrapped", opts.AppName, prevTag)
-
-	if err := step(ctx, "Stopping old container", func() error {
-		return stopContainer(ctx, client, opts.AppName)
-	}); err != nil {
-		return err
-	}
-
-	if err := step(ctx, "Starting container", func() error {
-		return startContainer(ctx, client, opts, wrappedPrev)
-	}); err != nil {
-		return err
-	}
-
-	if err := step(ctx, "Waiting for health", func() error {
-		return waitForHealthy(ctx, client, opts.AppName)
-	}); err != nil {
-		return err
-	}
-
-	return nil
+	return prevTag, nil
 }
 
 func servicesEnvStr(services map[string]string) string {

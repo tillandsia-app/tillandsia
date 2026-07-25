@@ -49,7 +49,7 @@ Each argument must be in KEY=VALUE format.
 
 Examples:
   tillandsia env set NODE_ENV=production
-  tillandsia env set DATABASE_URL=postgres://... REDIS_URL=redis://...
+  tillandsia env set DB_PATH=/data/db FOO=bar
 `,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {

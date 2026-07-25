@@ -14,6 +14,10 @@ import (
 	"github.com/tillandsia-app/tillandsia/internal/ssh"
 )
 
+// TODO: Consider a local CLI command that serves basic analytics from the
+// container through a proxy (geo stamping by IP, most visited pages, etc.)
+// so it's not exposed to the public internet.
+
 func init() {
 	rootCmd.AddCommand(logsCmd)
 
