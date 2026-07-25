@@ -327,6 +327,10 @@ func (c *Client) RunStream(ctx context.Context, cmd string, stdout, stderr io.Wr
 }
 
 func (c *Client) Transfer(ctx context.Context, reader io.Reader, dest string) error {
+	return c.PipeToCommand(ctx, reader, fmt.Sprintf("mkdir -p %s && cat > %s", filepath.Dir(dest), dest))
+}
+
+func (c *Client) PipeToCommand(ctx context.Context, reader io.Reader, remoteCmd string) error {
 	sess, err := c.client.NewSession()
 	if err != nil {
 		return fmt.Errorf("creating session: %w", err)
@@ -351,7 +355,6 @@ func (c *Client) Transfer(ctx context.Context, reader io.Reader, dest string) er
 	sess.Stdout = io.Discard
 	sess.Stderr = io.Discard
 
-	remoteCmd := fmt.Sprintf("mkdir -p %s && cat > %s", filepath.Dir(dest), dest)
 	if err := sess.Start(remoteCmd); err != nil {
 		w.Close()
 		return fmt.Errorf("starting remote command: %w", err)
